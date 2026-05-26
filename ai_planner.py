@@ -961,6 +961,45 @@ def build_profile_prompt(dataset_profile):
     return json.dumps(compact, indent=2)
 
 
+def build_supplemental_table_review(metadata, table_names):
+    if not table_names:
+        return []
+
+    profile_tables = {table["table_name"]: table for table in (metadata.get("dataset_profile", {}) or {}).get("tables", [])}
+    overlap_items = metadata.get("table_overlaps", [])
+    reviews = []
+
+    for table_name in table_names:
+        profile = profile_tables.get(table_name, {})
+        related = []
+        for item in overlap_items:
+            if item["left_table"] == table_name or item["right_table"] == table_name:
+                other = item["right_table"] if item["left_table"] == table_name else item["left_table"]
+                shared_keys = ", ".join(shared["left_column"] for shared in item.get("shared_key_columns", [])[:4])
+                related.append(
+                    {
+                        "related_table": other,
+                        "shared_key_count": item.get("shared_key_count", 0),
+                        "shared_column_count": item.get("shared_column_count", 0),
+                        "shared_keys_preview": shared_keys,
+                    }
+                )
+
+        reviews.append(
+            {
+                "table_name": table_name,
+                "table_kind": profile.get("table_kind", "unknown"),
+                "appears_to_represent": profile.get("appears_to_represent", "No profile description available."),
+                "row_count": profile.get("row_count"),
+                "primary_key_candidates": profile.get("primary_key_candidates", []),
+                "foreign_key_candidates": profile.get("foreign_key_candidates", []),
+                "related_tables": related[:5],
+            }
+        )
+
+    return reviews
+
+
 def make_fallback_plan(question, metadata):
     explicit_tables = find_explicit_table_mentions(question, metadata)
     if not explicit_tables:
@@ -968,6 +1007,7 @@ def make_fallback_plan(question, metadata):
     return {
         "question_type": "analysis",
         "required_tables": explicit_tables,
+        "optional_tables_for_cursory_review": [],
         "likely_grain": "depends_on_question",
         "join_strategy": "Prefer detected relationships and shared key columns such as UserId or OrgUnitId.",
         "metrics": ["Answer the user question with careful use of distinct counts where appropriate."],
@@ -975,6 +1015,8 @@ def make_fallback_plan(question, metadata):
         "duplication_risks": ["Joins may multiply rows; consider pre-aggregation or COUNT(DISTINCT ...)."],
         "assumptions": [],
         "reasoning_notes": ["Fallback plan used because planner JSON could not be parsed."],
+        "sufficiency_confidence": "medium",
+        "omission_rationale": "",
     }
 
 
@@ -985,6 +1027,7 @@ def generate_query_plan(question, dataset_profile, explicit_tables, client, mode
 Return JSON only with the following keys:
 - question_type
 - required_tables
+- optional_tables_for_cursory_review
 - likely_grain
 - join_strategy
 - metrics
@@ -992,6 +1035,8 @@ Return JSON only with the following keys:
 - duplication_risks
 - assumptions
 - reasoning_notes
+- sufficiency_confidence
+- omission_rationale
 
 Question:
 {question}
@@ -1004,9 +1049,11 @@ Dataset profile:
 
 Rules:
 1. If the user explicitly named tables, include them in required_tables unless clearly irrelevant.
-2. Prefer exact shared keys and explicit relationship hints over loose joins.
-3. Call out duplication risks whenever enrollments or event tables may multiply rows.
-4. Be concrete and concise.
+2. If one explicitly named table is probably redundant for the main SQL, put it in optional_tables_for_cursory_review and explain why in omission_rationale.
+3. Prefer exact shared keys and explicit relationship hints over loose joins.
+4. Call out duplication risks whenever enrollments or event tables may multiply rows.
+5. sufficiency_confidence should be low, medium, or high.
+6. Be concrete and concise.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -1015,19 +1062,69 @@ Rules:
     )
     raw = response.choices[0].message.content
     parsed = extract_json_object(raw)
-    return parsed or {}
+    if not parsed:
+        return {}
+
+    def _ensure_list(value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return [cleaned] if cleaned else []
+        return [str(value)]
+
+    normalized = dict(parsed)
+    normalized["required_tables"] = _ensure_list(parsed.get("required_tables"))
+    normalized["optional_tables_for_cursory_review"] = _ensure_list(parsed.get("optional_tables_for_cursory_review"))
+    normalized["metrics"] = _ensure_list(parsed.get("metrics"))
+    normalized["filters"] = _ensure_list(parsed.get("filters"))
+    normalized["duplication_risks"] = _ensure_list(parsed.get("duplication_risks"))
+    normalized["assumptions"] = _ensure_list(parsed.get("assumptions"))
+    normalized["reasoning_notes"] = _ensure_list(parsed.get("reasoning_notes"))
+    normalized["question_type"] = str(parsed.get("question_type", "analysis")).strip() or "analysis"
+    normalized["likely_grain"] = str(parsed.get("likely_grain", "depends_on_question")).strip() or "depends_on_question"
+    normalized["join_strategy"] = str(parsed.get("join_strategy", "")).strip()
+    normalized["sufficiency_confidence"] = str(parsed.get("sufficiency_confidence", "medium")).strip().lower() or "medium"
+    normalized["omission_rationale"] = str(parsed.get("omission_rationale", "")).strip()
+    return normalized
 
 
 def build_plan_markdown(plan):
+    def _as_list(value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return [cleaned] if cleaned else []
+        return [str(value)]
+
     lines = []
     lines.append(f"- Question type: {plan.get('question_type', 'unknown')}")
-    lines.append(f"- Required tables: {', '.join(plan.get('required_tables', [])) or 'n/a'}")
+    lines.append(f"- Required tables: {', '.join(_as_list(plan.get('required_tables'))) or 'n/a'}")
+    lines.append(
+        f"- Optional tables for cursory review: {', '.join(_as_list(plan.get('optional_tables_for_cursory_review'))) or 'n/a'}"
+    )
     lines.append(f"- Likely grain: {plan.get('likely_grain', 'n/a')}")
     lines.append(f"- Join strategy: {plan.get('join_strategy', 'n/a')}")
-    if plan.get("metrics"):
-        lines.append(f"- Metrics: {', '.join(plan['metrics'])}")
-    if plan.get("duplication_risks"):
-        lines.append(f"- Duplication risks: {', '.join(plan['duplication_risks'])}")
+    lines.append(f"- Sufficiency confidence: {plan.get('sufficiency_confidence', 'n/a')}")
+    metrics = _as_list(plan.get("metrics"))
+    risks = _as_list(plan.get("duplication_risks"))
+    assumptions = _as_list(plan.get("assumptions"))
+    notes = _as_list(plan.get("reasoning_notes"))
+    if metrics:
+        lines.append(f"- Metrics: {', '.join(metrics)}")
+    if risks:
+        lines.append(f"- Duplication risks: {', '.join(risks)}")
+    if assumptions:
+        lines.append(f"- Assumptions: {', '.join(assumptions)}")
+    if notes:
+        lines.append(f"- Notes: {', '.join(notes)}")
+    if plan.get("omission_rationale"):
+        lines.append(f"- Omission rationale: {plan.get('omission_rationale')}")
     return "\n".join(lines)
 
 
@@ -1109,15 +1206,23 @@ def validate_sql(sql_query, artifacts_dir):
             raise ValueError(f"Security alert: forbidden keyword detected: {keyword}")
 
     allowed_prefix = os.path.realpath(artifacts_dir).replace("\\", "/")
-    for literal in re.findall(r"'([^']*)'", clean_sql.replace("''", "")):
+
+    file_call_pattern = re.compile(
+        r"""(?ix)
+        \b(read_parquet|read_csv|read_csv_auto)\s*\(\s*'([^']*)'
+        """
+    )
+    file_literals = [match.group(2) for match in file_call_pattern.finditer(clean_sql.replace("''", ""))]
+
+    for literal in file_literals:
         if literal.lower().startswith(("http://", "https://", "s3://")):
             raise ValueError("Security alert: remote URLs are not permitted in this prototype.")
-        looks_like_path = "/" in literal or "\\" in literal or literal.endswith(".parquet") or literal.endswith(".csv")
-        if looks_like_path:
-            normalized = literal.replace("\\", "/")
-            target = os.path.realpath(os.path.dirname(normalized) if "*" in normalized else normalized).replace("\\", "/")
-            if not target.startswith(allowed_prefix):
-                raise ValueError("Security alert: the query references files outside the processed dataset.")
+
+        normalized = literal.replace("\\", "/")
+        target = os.path.realpath(os.path.dirname(normalized) if "*" in normalized else normalized).replace("\\", "/")
+        if not target.startswith(allowed_prefix):
+            raise ValueError("Security alert: the query references files outside the processed dataset.")
+
     if "LIMIT" not in upper_sql and not upper_sql.startswith("DESCRIBE"):
         clean_sql = f"SELECT * FROM ({clean_sql}) AS _limited LIMIT {HARD_ROW_LIMIT}"
     return clean_sql
@@ -1420,16 +1525,24 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
 
                 missing_explicit = [table for table in explicit_tables if table not in plan.get("required_tables", [])]
                 if missing_explicit:
-                    plan.setdefault("required_tables", [])
-                    plan["required_tables"] = sorted(set(plan["required_tables"] + missing_explicit))
+                    existing_optional = set(plan.get("optional_tables_for_cursory_review", []))
+                    plan["optional_tables_for_cursory_review"] = sorted(existing_optional.union(set(missing_explicit)))
                     plan.setdefault("reasoning_notes", []).append(
-                        f"Added explicitly named tables back into the plan: {', '.join(missing_explicit)}"
+                        f"Explicitly named tables not used in main SQL will receive a cursory supplemental review: {', '.join(missing_explicit)}"
                     )
 
                 st.markdown("**Plan**")
                 st.markdown(build_plan_markdown(plan))
                 with st.expander("Planner JSON", expanded=False):
                     st.json(plan)
+
+                supplemental_review = build_supplemental_table_review(
+                    metadata,
+                    [table for table in plan.get("optional_tables_for_cursory_review", []) if table not in plan.get("required_tables", [])],
+                )
+                if supplemental_review:
+                    with st.expander("Supplemental Table Review", expanded=False):
+                        st.json(supplemental_review)
 
                 context_block = build_context_block(metadata, user_input)
                 status.write("Generating SQL from plan")
