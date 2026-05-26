@@ -13,6 +13,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from pathlib import Path
 
 import duckdb
 import pandas as pd
@@ -1191,6 +1192,26 @@ def should_include_zero_activity_rows(question):
     return any(marker in q for marker in include_markers) and not any(marker in q for marker in exclude_markers)
 
 
+def default_join_key_pairs(metadata, required_tables):
+    required_set = set(required_tables or [])
+    pairs = []
+    for item in metadata.get("join_coverage", []):
+        if item["left_table"] in required_set and item["right_table"] in required_set:
+            pairs.append(
+                {
+                    "left_table": item["left_table"],
+                    "left_column": item["left_column"],
+                    "right_table": item["right_table"],
+                    "right_column": item["right_column"],
+                    "coverage_note": (
+                        f"overlap={item['overlap_distinct_keys']}, "
+                        f"left={item['left_coverage_pct']}%, right={item['right_coverage_pct']}%"
+                    ),
+                }
+            )
+    return pairs[:4]
+
+
 def make_fallback_plan(question, metadata):
     explicit_tables = find_explicit_table_mentions(question, metadata)
     if not explicit_tables:
@@ -1203,6 +1224,7 @@ def make_fallback_plan(question, metadata):
         "likely_grain": "depends_on_question",
         "population_scope": "full_population" if include_zero_rows else "question_specific_subset",
         "include_zero_activity_rows": include_zero_rows,
+        "join_key_pairs": default_join_key_pairs(metadata, explicit_tables),
         "join_strategy": "Prefer detected relationships and shared key columns such as UserId or OrgUnitId.",
         "metrics": ["Answer the user question with careful use of distinct counts where appropriate."],
         "filters": [],
@@ -1228,6 +1250,7 @@ Return JSON only with the following keys:
 - likely_grain
 - population_scope
 - include_zero_activity_rows
+- join_key_pairs
 - join_strategy
 - metrics
 - filters
@@ -1253,11 +1276,12 @@ Rules:
 4. If a table has very weak practical key overlap with the main analytical path, say so and consider moving it to optional_tables_for_cursory_review.
 5. Call out duplication risks whenever enrollments or event tables may multiply rows.
 6. When both UserId and OrgUnitId are available between tables, consider whether UserId + OrgUnitId is a more faithful join than UserId alone.
-7. If the question implies a full summary by role or group, set population_scope to full_population and include_zero_activity_rows to true so zero-activity groups remain visible.
-8. If the question is specifically about posters or active users only, you may set population_scope to filtered_subset and include_zero_activity_rows to false.
-9. If the question asks for ordering by a metric, reflect that in the plan notes so the final SQL can preserve the intended ranking.
-10. sufficiency_confidence should be low, medium, or high.
-11. Be concrete and concise.
+7. Populate join_key_pairs with the exact join columns the SQL should use. Each item should include left_table, left_column, right_table, and right_column.
+8. If the question implies a full summary by role or group, set population_scope to full_population and include_zero_activity_rows to true so zero-activity groups remain visible.
+9. If the question is specifically about posters or active users only, you may set population_scope to filtered_subset and include_zero_activity_rows to false.
+10. If the question asks for ordering by a metric, reflect that in the plan notes so the final SQL can preserve the intended ranking.
+11. sufficiency_confidence should be low, medium, or high.
+12. Be concrete and concise.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -1299,6 +1323,29 @@ Rules:
         normalized["include_zero_activity_rows"] = include_zero_raw.strip().lower() in {"true", "yes", "1"}
     else:
         normalized["include_zero_activity_rows"] = should_include_zero_activity_rows(question)
+    join_key_pairs = []
+    parsed_join_pairs = parsed.get("join_key_pairs")
+    if isinstance(parsed_join_pairs, list):
+        for item in parsed_join_pairs:
+            if not isinstance(item, dict):
+                continue
+            left_table = str(item.get("left_table", "")).strip()
+            left_column = str(item.get("left_column", "")).strip()
+            right_table = str(item.get("right_table", "")).strip()
+            right_column = str(item.get("right_column", "")).strip()
+            if left_table and left_column and right_table and right_column:
+                join_key_pairs.append(
+                    {
+                        "left_table": left_table,
+                        "left_column": left_column,
+                        "right_table": right_table,
+                        "right_column": right_column,
+                    }
+                )
+    normalized["join_key_pairs"] = join_key_pairs or default_join_key_pairs(
+        {"join_coverage": dataset_profile.get("join_coverage", [])},
+        normalized["required_tables"],
+    )
     normalized["join_strategy"] = str(parsed.get("join_strategy", "")).strip()
     normalized["sufficiency_confidence"] = str(parsed.get("sufficiency_confidence", "medium")).strip().lower() or "medium"
     normalized["omission_rationale"] = str(parsed.get("omission_rationale", "")).strip()
@@ -1326,6 +1373,15 @@ def build_plan_markdown(plan):
     lines.append(f"- Population scope: {plan.get('population_scope', 'n/a')}")
     lines.append(f"- Include zero-activity rows: {plan.get('include_zero_activity_rows', 'n/a')}")
     lines.append(f"- Join strategy: {plan.get('join_strategy', 'n/a')}")
+    join_pairs = plan.get("join_key_pairs") or []
+    if join_pairs:
+        formatted_pairs = ", ".join(
+            f"{item['left_table']}.{item['left_column']} -> {item['right_table']}.{item['right_column']}"
+            for item in join_pairs
+            if isinstance(item, dict)
+        )
+        if formatted_pairs:
+            lines.append(f"- Join key pairs: {formatted_pairs}")
     lines.append(f"- Sufficiency confidence: {plan.get('sufficiency_confidence', 'n/a')}")
     metrics = _as_list(plan.get("metrics"))
     risks = _as_list(plan.get("duplication_risks"))
@@ -1451,6 +1507,33 @@ def validate_sql(sql_query, artifacts_dir):
     return clean_sql
 
 
+def sql_join_pair_present(sql_text, left_column, right_column):
+    escaped_left = re.escape(left_column)
+    escaped_right = re.escape(right_column)
+    pattern = re.compile(
+        rf"""(?is)
+        (?:\b\w+\b\.)?"?{escaped_left}"?\s*=\s*(?:\b\w+\b\.)?"?{escaped_right}"?
+        |
+        (?:\b\w+\b\.)?"?{escaped_right}"?\s*=\s*(?:\b\w+\b\.)?"?{escaped_left}"?
+        """
+    )
+    return bool(pattern.search(sql_text or ""))
+
+
+def missing_join_key_pairs(sql_text, plan):
+    missing = []
+    for item in plan.get("join_key_pairs", []) or []:
+        if not isinstance(item, dict):
+            continue
+        left_col = item.get("left_column")
+        right_col = item.get("right_column")
+        if not left_col or not right_col:
+            continue
+        if not sql_join_pair_present(sql_text, left_col, right_col):
+            missing.append(item)
+    return missing
+
+
 def referenced_tables_in_sql(sql_text, metadata, artifacts_dir):
     found = []
     for table_name, info in metadata.get("tables", {}).items():
@@ -1534,6 +1617,109 @@ def critique_result(question, df, plan):
             + ". Supplemental tables, if any, were reviewed separately."
         )
     return warnings
+
+
+@st.cache_data(show_spinner=False)
+def build_local_package_bytes(app_source, requirements_text, config_text):
+    readme_text = f"""# Direction 2: AI Data Planner
+
+This local package lets you run the same Direction 2 app on your own machine.
+
+## What this is for
+
+- Large sanitized or dummy datasets that are awkward to upload in the cloud
+- Faster iteration when testing preprocessing and question-answering behavior
+- Local experiments with the same planning-first analysis flow
+
+## Recommended Python version
+
+- Python 3.12
+
+## Quick start
+
+1. Create a virtual environment.
+2. Install the requirements.
+3. Add your API key to `.streamlit/secrets.toml`.
+4. Run `streamlit run streamlit_app.py`.
+
+## Windows
+
+1. Open Command Prompt in this folder.
+2. Run `run_local_app.bat`
+
+## macOS / Linux
+
+1. Open Terminal in this folder.
+2. Run:
+   `chmod +x run_local_app.sh`
+3. Then run:
+   `./run_local_app.sh`
+
+## Manual setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+On Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\\Scripts\\Activate.ps1
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+## Secrets file
+
+Create `.streamlit/secrets.toml` based on `.streamlit/secrets.toml.example`.
+
+## Notes
+
+- Use sanitized or dummy data only.
+- For multi-entity LMS-style exports, `Keep files as separate tables` is usually the better choice.
+- Local mode avoids browser-upload limits, but very large jobs still depend on your machine's RAM and disk.
+"""
+
+    secrets_example = """DEEPSEEK_API_KEY = "your-api-key-here"
+OPENAI_API_KEY = "your-api-key-here"
+XAI_API_KEY = "your-api-key-here"
+"""
+
+    run_bat = """@echo off
+if not exist .venv (
+    python -m venv .venv
+)
+call .venv\\Scripts\\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+"""
+
+    run_sh = """#!/usr/bin/env bash
+set -euo pipefail
+if [ ! -d ".venv" ]; then
+  python3 -m venv .venv
+fi
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+"""
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("streamlit_app.py", app_source)
+        zf.writestr("requirements.txt", requirements_text)
+        zf.writestr(".streamlit/config.toml", config_text)
+        zf.writestr(".streamlit/secrets.toml.example", secrets_example)
+        zf.writestr("README.md", readme_text)
+        zf.writestr("run_local_app.bat", run_bat)
+        zf.writestr("run_local_app.sh", run_sh)
+    return buffer.getvalue()
 
 
 def summarize_answer(question, plan, df, warnings, client, model_name, pii_redaction_enabled):
@@ -1707,6 +1893,48 @@ Output one question per line and nothing else.
         return []
 
 
+def render_local_download_ui():
+    app_path = Path(__file__).resolve()
+    app_source = app_path.read_text(encoding="utf-8")
+
+    requirements_path = app_path.with_name("requirements.txt")
+    if requirements_path.exists():
+        requirements_text = requirements_path.read_text(encoding="utf-8")
+    else:
+        requirements_text = "streamlit>=1.45,<2\nduckdb>=1.1,<2\npandas>=2.2,<3\npyarrow>=16,<22\nopenai>=1.30,<2\n"
+
+    config_path = app_path.parent / ".streamlit" / "config.toml"
+    if config_path.exists():
+        config_text = config_path.read_text(encoding="utf-8")
+    else:
+        config_text = "[server]\nmaxUploadSize = 2048\n"
+
+    package_bytes = build_local_package_bytes(app_source, requirements_text, config_text)
+
+    with st.expander("Run locally for larger datasets", expanded=False):
+        st.markdown(
+            """
+            Use this when your sanitized datasets are too large for browser upload or when you want more control over local CPU, RAM, and disk.
+
+            The download includes:
+            - `streamlit_app.py`
+            - `requirements.txt`
+            - `.streamlit/config.toml`
+            - `.streamlit/secrets.toml.example`
+            - `README.md`
+            - `run_local_app.bat`
+            - `run_local_app.sh`
+            """
+        )
+        st.download_button(
+            "Download local run package",
+            data=package_bytes,
+            file_name="direction2_ai_planner_local_package.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+
 def render_sidebar():
     with st.sidebar:
         st.title("Configuration")
@@ -1765,6 +1993,8 @@ def render_processing_ui():
             This prototype is meant to test whether stronger AI planning improves accuracy and reliability for large structured datasets.
             """
         )
+
+    render_local_download_ui()
 
     strategy = st.radio(
         "Preprocessing strategy",
@@ -1905,6 +2135,25 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                         user_input,
                         sql,
                         f"Generated SQL omitted planned tables: {', '.join(missing_required)}",
+                        plan,
+                        table_inventory,
+                        context_block,
+                        relationship_context,
+                        client,
+                        model_name,
+                    )
+
+                missing_join_pairs = missing_join_key_pairs(sql, plan)
+                if missing_join_pairs:
+                    status.write("Repairing SQL to enforce planned join keys")
+                    pair_labels = ", ".join(
+                        f"{item['left_table']}.{item['left_column']} -> {item['right_table']}.{item['right_column']}"
+                        for item in missing_join_pairs
+                    )
+                    sql = fix_sql_query(
+                        user_input,
+                        sql,
+                        f"Generated SQL did not clearly use the planned join keys: {pair_labels}",
                         plan,
                         table_inventory,
                         context_block,
