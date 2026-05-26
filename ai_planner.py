@@ -37,6 +37,8 @@ UPLOAD_WARNING_MB = 400
 HARD_ROW_LIMIT = 1000
 MAX_ROWS_FOR_SUMMARY = 50
 DEFAULT_PROVIDER_NAME = "DeepSeek"
+JOIN_COVERAGE_SAMPLE_LIMIT = 50000
+MAX_JOIN_COVERAGE_HINTS = 12
 
 PROVIDER_CONFIG = {
     "DeepSeek": {
@@ -418,6 +420,109 @@ def analyze_table_overlaps(metadata):
     return overlaps
 
 
+def analyze_join_coverage(conn, metadata, artifacts_dir):
+    coverage_rows = []
+    table_map = metadata.get("tables", {})
+    overlaps = metadata.get("table_overlaps", [])
+
+    for item in overlaps:
+        left_table = item["left_table"]
+        right_table = item["right_table"]
+        left_info = table_map.get(left_table, {})
+        right_info = table_map.get(right_table, {})
+        if not left_info or not right_info:
+            continue
+
+        left_pattern = os.path.join(artifacts_dir, left_info["file_pattern"]).replace("\\", "/")
+        right_pattern = os.path.join(artifacts_dir, right_info["file_pattern"]).replace("\\", "/")
+
+        best_result = None
+        for shared in item.get("shared_key_columns", [])[:4]:
+            left_col = shared["left_column"]
+            right_col = shared["right_column"]
+            try:
+                stats = conn.execute(
+                    f"""
+                    WITH left_keys AS (
+                        SELECT DISTINCT TRIM(CAST("{left_col}" AS VARCHAR)) AS join_key
+                        FROM read_parquet('{left_pattern}')
+                        WHERE "{left_col}" IS NOT NULL
+                        LIMIT {JOIN_COVERAGE_SAMPLE_LIMIT}
+                    ),
+                    right_keys AS (
+                        SELECT DISTINCT TRIM(CAST("{right_col}" AS VARCHAR)) AS join_key
+                        FROM read_parquet('{right_pattern}')
+                        WHERE "{right_col}" IS NOT NULL
+                        LIMIT {JOIN_COVERAGE_SAMPLE_LIMIT}
+                    ),
+                    overlap AS (
+                        SELECT COUNT(*) AS overlap_distinct
+                        FROM left_keys lk
+                        INNER JOIN right_keys rk ON lk.join_key = rk.join_key
+                    )
+                    SELECT
+                        (SELECT COUNT(*) FROM left_keys) AS left_distinct,
+                        (SELECT COUNT(*) FROM right_keys) AS right_distinct,
+                        (SELECT overlap_distinct FROM overlap) AS overlap_distinct
+                    """
+                ).fetchone()
+            except Exception as exc:
+                logging.info(
+                    "Join coverage failed for %s.%s <-> %s.%s: %s",
+                    left_table,
+                    left_col,
+                    right_table,
+                    right_col,
+                    exc,
+                )
+                continue
+
+            left_distinct = int(stats[0] or 0)
+            right_distinct = int(stats[1] or 0)
+            overlap_distinct = int(stats[2] or 0)
+            if left_distinct == 0 or right_distinct == 0:
+                continue
+
+            left_coverage = round((overlap_distinct / left_distinct) * 100, 2)
+            right_coverage = round((overlap_distinct / right_distinct) * 100, 2)
+            avg_coverage = round((left_coverage + right_coverage) / 2, 2)
+            result = {
+                "left_table": left_table,
+                "right_table": right_table,
+                "left_column": left_col,
+                "right_column": right_col,
+                "left_distinct_keys": left_distinct,
+                "right_distinct_keys": right_distinct,
+                "overlap_distinct_keys": overlap_distinct,
+                "left_coverage_pct": left_coverage,
+                "right_coverage_pct": right_coverage,
+                "average_coverage_pct": avg_coverage,
+                "sample_limited": left_distinct >= JOIN_COVERAGE_SAMPLE_LIMIT or right_distinct >= JOIN_COVERAGE_SAMPLE_LIMIT,
+            }
+            if not best_result or (
+                result["overlap_distinct_keys"],
+                result["average_coverage_pct"],
+            ) > (
+                best_result["overlap_distinct_keys"],
+                best_result["average_coverage_pct"],
+            ):
+                best_result = result
+
+        if best_result:
+            coverage_rows.append(best_result)
+
+    coverage_rows.sort(
+        key=lambda row: (
+            row["overlap_distinct_keys"],
+            row["average_coverage_pct"],
+            row["left_coverage_pct"],
+            row["right_coverage_pct"],
+        ),
+        reverse=True,
+    )
+    return coverage_rows
+
+
 def infer_table_kind(table_name, column_names):
     name = table_name.lower()
     norm_cols = {normalize_identifier(col) for col in column_names}
@@ -486,6 +591,7 @@ def build_dataset_profile(metadata):
         "tables": tables,
         "relationships": metadata.get("relationships", []),
         "table_overlaps": metadata.get("table_overlaps", []),
+        "join_coverage": metadata.get("join_coverage", [])[:MAX_JOIN_COVERAGE_HINTS],
     }
 
 
@@ -666,6 +772,7 @@ def process_uploaded_files(uploaded_files, strategy):
             "relationships": result["relationships"],
         }
         metadata["table_overlaps"] = analyze_table_overlaps(metadata)
+        metadata["join_coverage"] = analyze_join_coverage(conn, metadata, artifacts_dir)
         metadata["dataset_profile"] = build_dataset_profile(metadata)
 
         with open(os.path.join(artifacts_dir, "metadata.json"), "w", encoding="utf-8") as handle:
@@ -798,17 +905,20 @@ def build_columns_dataframe(metadata, table_name):
 
 def build_table_overview_rows(metadata):
     column_counts = {}
+    table_columns = {}
     for column in metadata.get("columns", []):
         column_counts[column["table"]] = column_counts.get(column["table"], 0) + 1
+        table_columns.setdefault(column["table"], []).append(column["name"])
     rows = []
     for table_name, info in metadata.get("tables", {}).items():
+        cols = table_columns.get(table_name, [])
         rows.append(
             {
                 "table_name": table_name,
                 "row_count": info.get("total_rows", 0),
                 "column_count": column_counts.get(table_name, 0),
-                "table_kind": infer_table_kind(table_name, list(column_counts.keys())),
-                "appears_to_represent": infer_table_description(table_name, list(column_counts.keys())),
+                "table_kind": infer_table_kind(table_name, cols),
+                "appears_to_represent": infer_table_description(table_name, cols),
             }
         )
     return pd.DataFrame(rows)
@@ -894,6 +1004,27 @@ def handle_metadata_question(question, metadata):
             "title": "Answered directly from overlap analysis",
         }
 
+    if ("join coverage" in q or "join quality" in q or "best join" in q) and metadata.get("join_coverage"):
+        rows = []
+        for item in metadata.get("join_coverage", []):
+            rows.append(
+                {
+                    "left_table": item["left_table"],
+                    "right_table": item["right_table"],
+                    "left_column": item["left_column"],
+                    "right_column": item["right_column"],
+                    "overlap_distinct_keys": item["overlap_distinct_keys"],
+                    "left_coverage_pct": item["left_coverage_pct"],
+                    "right_coverage_pct": item["right_coverage_pct"],
+                    "sample_limited": item.get("sample_limited", False),
+                }
+            )
+        return {
+            "dataframe": pd.DataFrame(rows),
+            "answer": "The table below shows measured join coverage for likely key pairs across the processed tables.",
+            "title": "Answered directly from join coverage analysis",
+        }
+
     return None
 
 
@@ -908,17 +1039,34 @@ def get_overlap_relationship_hints(metadata):
     return hints
 
 
+def get_join_coverage_hints(metadata):
+    hints = []
+    for item in metadata.get("join_coverage", [])[:MAX_JOIN_COVERAGE_HINTS]:
+        sample_note = " (sample-limited)" if item.get("sample_limited") else ""
+        hints.append(
+            "- "
+            f"{item['left_table']}.{item['left_column']} <-> {item['right_table']}.{item['right_column']} "
+            f"| overlap keys={item['overlap_distinct_keys']} "
+            f"| left coverage={item['left_coverage_pct']}% "
+            f"| right coverage={item['right_coverage_pct']}%{sample_note}"
+        )
+    return hints
+
+
 def build_relationship_context(metadata):
     relationships = [
         f"- {item['from_table']}.{item['from_column']} -> {item['to_table']}.{item['to_column']}"
         for item in metadata.get("relationships", [])
     ]
     overlap_hints = get_overlap_relationship_hints(metadata)
+    coverage_hints = get_join_coverage_hints(metadata)
     blocks = []
     if relationships:
         blocks.append("KNOWN RELATIONSHIPS:\n" + "\n".join(relationships))
     if overlap_hints:
         blocks.append("OVERLAP HINTS:\n" + "\n".join(overlap_hints))
+    if coverage_hints:
+        blocks.append("JOIN COVERAGE HINTS:\n" + "\n".join(coverage_hints))
     return "\n\n".join(blocks)
 
 
@@ -957,6 +1105,7 @@ def build_profile_prompt(dataset_profile):
         ],
         "relationships": dataset_profile.get("relationships", []),
         "table_overlaps": dataset_profile.get("table_overlaps", [])[:10],
+        "join_coverage": dataset_profile.get("join_coverage", [])[:MAX_JOIN_COVERAGE_HINTS],
     }
     return json.dumps(compact, indent=2)
 
@@ -967,6 +1116,7 @@ def build_supplemental_table_review(metadata, table_names):
 
     profile_tables = {table["table_name"]: table for table in (metadata.get("dataset_profile", {}) or {}).get("tables", [])}
     overlap_items = metadata.get("table_overlaps", [])
+    join_coverage_items = metadata.get("join_coverage", [])
     reviews = []
 
     for table_name in table_names:
@@ -985,6 +1135,21 @@ def build_supplemental_table_review(metadata, table_names):
                     }
                 )
 
+        join_coverage = []
+        for item in join_coverage_items:
+            if item["left_table"] == table_name or item["right_table"] == table_name:
+                other = item["right_table"] if item["left_table"] == table_name else item["left_table"]
+                join_coverage.append(
+                    {
+                        "related_table": other,
+                        "join_pair": f"{item['left_column']} <-> {item['right_column']}",
+                        "overlap_distinct_keys": item.get("overlap_distinct_keys", 0),
+                        "left_coverage_pct": item.get("left_coverage_pct"),
+                        "right_coverage_pct": item.get("right_coverage_pct"),
+                        "sample_limited": item.get("sample_limited", False),
+                    }
+                )
+
         reviews.append(
             {
                 "table_name": table_name,
@@ -994,27 +1159,59 @@ def build_supplemental_table_review(metadata, table_names):
                 "primary_key_candidates": profile.get("primary_key_candidates", []),
                 "foreign_key_candidates": profile.get("foreign_key_candidates", []),
                 "related_tables": related[:5],
+                "join_coverage_hints": join_coverage[:5],
             }
         )
 
     return reviews
 
 
+def should_include_zero_activity_rows(question):
+    q = (question or "").lower()
+    include_markers = [
+        "summary",
+        "role-level",
+        "one row per",
+        "show ",
+        "by role",
+        "posting percentage",
+        "engagement",
+        "all roles",
+        "per role",
+    ]
+    exclude_markers = [
+        "who posted",
+        "users who posted",
+        "posted at least one",
+        "among posters",
+        "post authors",
+        "authors who posted",
+        "only posters",
+    ]
+    return any(marker in q for marker in include_markers) and not any(marker in q for marker in exclude_markers)
+
+
 def make_fallback_plan(question, metadata):
     explicit_tables = find_explicit_table_mentions(question, metadata)
     if not explicit_tables:
         explicit_tables = list(metadata.get("tables", {}).keys())[:2]
+    include_zero_rows = should_include_zero_activity_rows(question)
     return {
         "question_type": "analysis",
         "required_tables": explicit_tables,
         "optional_tables_for_cursory_review": [],
         "likely_grain": "depends_on_question",
+        "population_scope": "full_population" if include_zero_rows else "question_specific_subset",
+        "include_zero_activity_rows": include_zero_rows,
         "join_strategy": "Prefer detected relationships and shared key columns such as UserId or OrgUnitId.",
         "metrics": ["Answer the user question with careful use of distinct counts where appropriate."],
         "filters": [],
         "duplication_risks": ["Joins may multiply rows; consider pre-aggregation or COUNT(DISTINCT ...)."],
         "assumptions": [],
-        "reasoning_notes": ["Fallback plan used because planner JSON could not be parsed."],
+        "reasoning_notes": [
+            "Fallback plan used because planner JSON could not be parsed.",
+            "Prefer join paths with stronger measured key overlap when several options are available.",
+        ],
         "sufficiency_confidence": "medium",
         "omission_rationale": "",
     }
@@ -1029,6 +1226,8 @@ Return JSON only with the following keys:
 - required_tables
 - optional_tables_for_cursory_review
 - likely_grain
+- population_scope
+- include_zero_activity_rows
 - join_strategy
 - metrics
 - filters
@@ -1050,10 +1249,15 @@ Dataset profile:
 Rules:
 1. If the user explicitly named tables, include them in required_tables unless clearly irrelevant.
 2. If one explicitly named table is probably redundant for the main SQL, put it in optional_tables_for_cursory_review and explain why in omission_rationale.
-3. Prefer exact shared keys and explicit relationship hints over loose joins.
-4. Call out duplication risks whenever enrollments or event tables may multiply rows.
-5. sufficiency_confidence should be low, medium, or high.
-6. Be concrete and concise.
+3. Prefer exact shared keys, explicit relationship hints, and stronger measured join coverage over loose joins.
+4. If a table has very weak practical key overlap with the main analytical path, say so and consider moving it to optional_tables_for_cursory_review.
+5. Call out duplication risks whenever enrollments or event tables may multiply rows.
+6. When both UserId and OrgUnitId are available between tables, consider whether UserId + OrgUnitId is a more faithful join than UserId alone.
+7. If the question implies a full summary by role or group, set population_scope to full_population and include_zero_activity_rows to true so zero-activity groups remain visible.
+8. If the question is specifically about posters or active users only, you may set population_scope to filtered_subset and include_zero_activity_rows to false.
+9. If the question asks for ordering by a metric, reflect that in the plan notes so the final SQL can preserve the intended ranking.
+10. sufficiency_confidence should be low, medium, or high.
+11. Be concrete and concise.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -1085,6 +1289,16 @@ Rules:
     normalized["reasoning_notes"] = _ensure_list(parsed.get("reasoning_notes"))
     normalized["question_type"] = str(parsed.get("question_type", "analysis")).strip() or "analysis"
     normalized["likely_grain"] = str(parsed.get("likely_grain", "depends_on_question")).strip() or "depends_on_question"
+    normalized["population_scope"] = str(parsed.get("population_scope", "")).strip() or (
+        "full_population" if should_include_zero_activity_rows(question) else "question_specific_subset"
+    )
+    include_zero_raw = parsed.get("include_zero_activity_rows")
+    if isinstance(include_zero_raw, bool):
+        normalized["include_zero_activity_rows"] = include_zero_raw
+    elif isinstance(include_zero_raw, str):
+        normalized["include_zero_activity_rows"] = include_zero_raw.strip().lower() in {"true", "yes", "1"}
+    else:
+        normalized["include_zero_activity_rows"] = should_include_zero_activity_rows(question)
     normalized["join_strategy"] = str(parsed.get("join_strategy", "")).strip()
     normalized["sufficiency_confidence"] = str(parsed.get("sufficiency_confidence", "medium")).strip().lower() or "medium"
     normalized["omission_rationale"] = str(parsed.get("omission_rationale", "")).strip()
@@ -1109,6 +1323,8 @@ def build_plan_markdown(plan):
         f"- Optional tables for cursory review: {', '.join(_as_list(plan.get('optional_tables_for_cursory_review'))) or 'n/a'}"
     )
     lines.append(f"- Likely grain: {plan.get('likely_grain', 'n/a')}")
+    lines.append(f"- Population scope: {plan.get('population_scope', 'n/a')}")
+    lines.append(f"- Include zero-activity rows: {plan.get('include_zero_activity_rows', 'n/a')}")
     lines.append(f"- Join strategy: {plan.get('join_strategy', 'n/a')}")
     lines.append(f"- Sufficiency confidence: {plan.get('sufficiency_confidence', 'n/a')}")
     metrics = _as_list(plan.get("metrics"))
@@ -1150,8 +1366,10 @@ SQL RULES:
 3. Prefer CTEs and pre-aggregation when joins can multiply rows.
 4. Use exact column names from the schema.
 5. Use COUNT(DISTINCT ...) when the metric asks for distinct users or entities.
-6. Default to LIMIT 50 unless the query is already aggregated.
-7. Output only SQL, but leading SQL comments are allowed if helpful.
+6. If include_zero_activity_rows is true or population_scope is full_population, preserve the base population with LEFT JOINs to aggregated activity tables so zero-activity groups remain visible.
+7. Use INNER JOIN only when the question is explicitly about posters, active records, or filtered subsets only.
+8. Default to LIMIT 50 unless the query is already aggregated.
+9. Output only SQL, but leading SQL comments are allowed if helpful.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -1182,6 +1400,11 @@ AVAILABLE TABLES:
 
 {context_block}
 {relationship_context}
+
+Repair rules:
+1. Preserve the intended population scope from the plan.
+2. If include_zero_activity_rows is true, do not filter away zero-activity groups with an INNER JOIN to the activity table.
+3. Keep the SQL DuckDB-compatible and use only the available tables and columns.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -1237,6 +1460,31 @@ def referenced_tables_in_sql(sql_text, metadata, artifacts_dir):
     return sorted(set(found))
 
 
+def result_looks_like_poster_only_subset(df, plan):
+    if df.empty or not plan.get("include_zero_activity_rows"):
+        return False
+
+    lower_cols = {col.lower(): col for col in df.columns}
+    if "distinct_users_who_posted" not in lower_cols or "distinct_enrolled_users" not in lower_cols:
+        return False
+
+    posters = pd.to_numeric(df[lower_cols["distinct_users_who_posted"]], errors="coerce")
+    enrolled = pd.to_numeric(df[lower_cols["distinct_enrolled_users"]], errors="coerce")
+    comparable = posters.notna() & enrolled.notna() & (enrolled > 0)
+    if not comparable.any():
+        return False
+
+    all_equal = (posters[comparable] == enrolled[comparable]).all()
+    has_posting_metric = False
+    for col in df.columns:
+        if any(token in col.lower() for token in ["posting_percentage", "total_discussion_posts", "distinct_users_who_posted"]):
+            series = pd.to_numeric(df[col], errors="coerce")
+            if series.notna().any():
+                has_posting_metric = True
+                break
+    return bool(all_equal and has_posting_metric)
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def execute_validated_sql(clean_sql, _artifacts_dir):
     conn = duckdb.connect(database=":memory:")
@@ -1266,8 +1514,25 @@ def critique_result(question, df, plan):
         warnings.append("Query returned no rows.")
     if len(df) >= HARD_ROW_LIMIT:
         warnings.append("Results hit the row cap.")
+    if "post" in question.lower():
+        posting_cols = [col for col in df.columns if any(token in col.lower() for token in ["posted", "posts", "posting"])]
+        if posting_cols:
+            posting_values = pd.concat([pd.to_numeric(df[col], errors="coerce") for col in posting_cols], axis=1)
+            if posting_values.notna().any().any() and posting_values.fillna(0).sum().sum() == 0:
+                warnings.append(
+                    "Posting-related metrics are all zero in the current result. That may be real, or it may mean the chosen join path is too restrictive."
+                )
+    if result_looks_like_poster_only_subset(df, plan):
+        warnings.append(
+            "The result looks like a poster-only subset even though the plan expected zero-activity groups to remain visible."
+        )
+
     if plan.get("required_tables"):
-        warnings.append(f"Plan expected tables: {', '.join(plan['required_tables'])}")
+        warnings.append(
+            "Main analysis tables: "
+            + ", ".join(plan["required_tables"])
+            + ". Supplemental tables, if any, were reviewed separately."
+        )
     return warnings
 
 
@@ -1306,7 +1571,86 @@ Rules:
     return response.choices[0].message.content
 
 
-def attempt_visualization(df):
+def select_primary_metric(question, plan, df):
+    if df.empty:
+        return None
+
+    numeric_cols = [col for col in df.select_dtypes(include=["number"]).columns.tolist() if df[col].notna().any()]
+    if not numeric_cols:
+        return None
+
+    lowered = question.lower()
+    ordered_candidates = []
+    if "posting percentage" in lowered or "percentage" in lowered or "rate" in lowered:
+        ordered_candidates.extend(["posting_percentage", "engagement_percentage"])
+    if "average" in lowered or "avg" in lowered:
+        ordered_candidates.extend(["avg_posts_per_posting_user", "average_posts_per_posting_user"])
+    if "post" in lowered:
+        ordered_candidates.extend(["total_discussion_posts", "distinct_users_who_posted"])
+    if "enroll" in lowered:
+        ordered_candidates.append("distinct_enrolled_users")
+
+    ordered_candidates.extend(
+        [
+            "posting_percentage",
+            "total_discussion_posts",
+            "distinct_users_who_posted",
+            "distinct_enrolled_users",
+        ]
+    )
+
+    seen = set()
+    for col in ordered_candidates:
+        if col in numeric_cols and col not in seen:
+            seen.add(col)
+            return col
+
+    percent_like = [col for col in numeric_cols if "percent" in col.lower() or "rate" in col.lower()]
+    if percent_like:
+        return percent_like[0]
+
+    count_like = [
+        col
+        for col in numeric_cols
+        if any(token in col.lower() for token in ["count", "total", "posts", "users", "rows"])
+    ]
+    if count_like:
+        return count_like[0]
+    return numeric_cols[0]
+
+
+def prepare_result_for_display(question, plan, df):
+    if df.empty:
+        return df, None, None
+
+    display_df = df.copy()
+    metric_col = select_primary_metric(question, plan, display_df)
+    category_col = None
+
+    categorical_cols = display_df.select_dtypes(include=["object", "string", "category"]).columns.tolist()
+    if categorical_cols:
+        preferred_labels = ["rolename", "table_name", "left_table", "right_table", "column_name"]
+        for preferred in preferred_labels:
+            for col in categorical_cols:
+                if col.lower() == preferred:
+                    category_col = col
+                    break
+            if category_col:
+                break
+        if not category_col:
+            category_col = categorical_cols[0]
+
+    if metric_col:
+        display_df = display_df.sort_values(
+            by=[metric_col] + ([category_col] if category_col and category_col in display_df.columns else []),
+            ascending=[False] + ([True] if category_col and category_col in display_df.columns else []),
+            kind="stable",
+        ).reset_index(drop=True)
+
+    return display_df, metric_col, category_col
+
+
+def attempt_visualization(df, question, plan, metric_col=None, category_col=None):
     try:
         if df.empty or len(df) < 2:
             return
@@ -1314,9 +1658,14 @@ def attempt_visualization(df):
         categorical_cols = df.select_dtypes(include=["object", "string", "category"]).columns.tolist()
         if len(df.columns) <= 2 and len(df) <= 5 and numeric_cols:
             return
+        metric_col = metric_col or select_primary_metric(question, plan, df)
+        if metric_col and metric_col in df.columns:
+            series = pd.to_numeric(df[metric_col], errors="coerce")
+            if series.notna().any() and series.fillna(0).sum() == 0:
+                return
         st.caption("Auto-visualization")
-        if categorical_cols and numeric_cols:
-            chart_df = df.head(25).set_index(categorical_cols[0])[numeric_cols[0]]
+        if category_col and metric_col and category_col in df.columns and metric_col in df.columns:
+            chart_df = df.head(20).set_index(category_col)[metric_col]
             st.bar_chart(chart_df)
             return
         if len(numeric_cols) >= 2:
@@ -1586,30 +1935,49 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                     clean_sql = validate_sql(sql_retry, artifacts_dir)
                     df = execute_validated_sql(clean_sql, artifacts_dir)
 
-                st.dataframe(df, use_container_width=True)
-                if not df.empty:
+                if result_looks_like_poster_only_subset(df, plan):
+                    status.write("Result looks poster-only. Repairing SQL to preserve zero-activity groups.")
+                    sql_retry = fix_sql_query(
+                        user_input,
+                        sql,
+                        "The result appears to exclude zero-activity groups even though the plan expects a full-population summary. Rewrite the query to preserve the base population and LEFT JOIN aggregated activity.",
+                        plan,
+                        table_inventory,
+                        context_block,
+                        relationship_context,
+                        client,
+                        model_name,
+                    )
+                    st.code(sanitize_sql_for_display(sql_retry, metadata, artifacts_dir), language="sql")
+                    clean_sql = validate_sql(sql_retry, artifacts_dir)
+                    df = execute_validated_sql(clean_sql, artifacts_dir)
+
+                display_df, metric_col, category_col = prepare_result_for_display(user_input, plan, df)
+
+                st.dataframe(display_df, use_container_width=True)
+                if not display_df.empty:
                     st.download_button(
                         "Download results as CSV",
-                        data=df.to_csv(index=False),
+                        data=display_df.to_csv(index=False),
                         file_name="query_results.csv",
                         mime="text/csv",
                     )
-                    attempt_visualization(df)
+                    attempt_visualization(display_df, user_input, plan, metric_col=metric_col, category_col=category_col)
 
-                warnings = critique_result(user_input, df, plan)
+                warnings = critique_result(user_input, display_df, plan)
                 if warnings:
                     st.markdown("**Critique**")
                     for warning in warnings:
                         st.warning(warning)
 
                 status.write("Summarizing result")
-                if df.empty:
+                if display_df.empty:
                     answer = "The query returned no rows. Try broadening the question or checking the filter assumptions."
                 else:
                     answer = summarize_answer(
                         user_input,
                         plan,
-                        df,
+                        display_df,
                         warnings,
                         client,
                         model_name,
