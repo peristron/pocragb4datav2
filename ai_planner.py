@@ -843,6 +843,98 @@ def strip_leading_sql_comments(sql_text):
     return cleaned
 
 
+def strip_trailing_sql_comments(sql_text):
+    if not sql_text:
+        return sql_text
+    cleaned = sql_text.rstrip()
+    while True:
+        lines = cleaned.splitlines()
+        if not lines:
+            return ""
+        last_line = lines[-1].strip()
+        if not last_line:
+            cleaned = "\n".join(lines[:-1]).rstrip()
+            continue
+        if last_line.startswith("--"):
+            cleaned = "\n".join(lines[:-1]).rstrip()
+            continue
+        if cleaned.endswith("*/"):
+            start = cleaned.rfind("/*")
+            if start != -1:
+                trailer = cleaned[start:]
+                if "\n" not in trailer or trailer.strip().startswith("/*"):
+                    cleaned = cleaned[:start].rstrip()
+                    continue
+        break
+    return cleaned
+
+
+def split_sql_and_trailing_comments(sql_text):
+    text = strip_leading_sql_comments((sql_text or "").strip())
+    if not text:
+        return "", ""
+
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_single:
+            if ch == "'" and nxt == "'":
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if ch == "-" and nxt == "-":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch == ";":
+            statement = text[:i].rstrip()
+            trailing = text[i + 1 :].strip()
+            return statement, trailing
+        i += 1
+
+    return text.strip(), ""
+
+
 def _strip_markdown_sql(text):
     clean = (text or "").strip()
     if clean.startswith("```sql"):
@@ -1471,7 +1563,12 @@ Repair rules:
 
 
 def validate_sql(sql_query, artifacts_dir):
-    clean_sql = strip_leading_sql_comments(sql_query).strip().rstrip(";").strip()
+    statement_sql, trailing_sql = split_sql_and_trailing_comments(sql_query)
+    trailing_sql = strip_trailing_sql_comments(trailing_sql).strip()
+    if trailing_sql:
+        raise ValueError("Security alert: multiple SQL statements are not allowed.")
+
+    clean_sql = strip_trailing_sql_comments(statement_sql).strip().rstrip(";").strip()
     if not clean_sql:
         raise ValueError("Security alert: empty SQL query.")
     sql_without_strings = re.sub(r"'[^']*'", "", clean_sql)
@@ -1681,6 +1778,7 @@ Create `.streamlit/secrets.toml` based on `.streamlit/secrets.toml.example`.
 
 - Use sanitized or dummy data only.
 - For multi-entity LMS-style exports, `Keep files as separate tables` is usually the better choice.
+- The local package uses a much higher upload setting than the cloud app.
 - Local mode avoids browser-upload limits, but very large jobs still depend on your machine's RAM and disk.
 """
 
@@ -1909,7 +2007,11 @@ def render_local_download_ui():
     else:
         config_text = "[server]\nmaxUploadSize = 2048\n"
 
-    package_bytes = build_local_package_bytes(app_source, requirements_text, config_text)
+    local_config_text = """[server]
+maxUploadSize = 10240
+"""
+
+    package_bytes = build_local_package_bytes(app_source, requirements_text, local_config_text)
 
     with st.expander("Run locally for larger datasets", expanded=False):
         st.markdown(
