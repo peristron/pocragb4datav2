@@ -228,6 +228,15 @@ def get_all_csvs(root_dir):
     return sorted(csv_files)
 
 
+def get_all_zips(root_dir):
+    zip_files = []
+    for root, _, files in os.walk(root_dir):
+        for file_name in files:
+            if file_name.lower().endswith(".zip"):
+                zip_files.append(os.path.join(root, file_name))
+    return sorted(zip_files)
+
+
 def get_parquet_row_count(parquet_path):
     return pq.ParquetFile(parquet_path).metadata.num_rows
 
@@ -240,6 +249,54 @@ def safe_extract(zip_path, target_dir):
             if not str(member_path).startswith(str(target)):
                 raise ValueError(f"Security alert: ZIP member escapes target directory: {member}")
         zf.extractall(target_dir)
+
+
+def parse_local_source_entries(raw_text):
+    entries = []
+    for line in (raw_text or "").splitlines():
+        for piece in line.split(","):
+            cleaned = piece.strip().strip('"').strip("'")
+            if cleaned:
+                entries.append(cleaned)
+    return entries
+
+
+def collect_local_source_files(source_entries, extraction_dir, status):
+    csv_paths = []
+    seen_csv = set()
+    zip_paths = []
+
+    for entry in source_entries:
+        abs_entry = os.path.abspath(os.path.expanduser(entry))
+        if not os.path.exists(abs_entry):
+            raise ValueError(f"Local source not found: {entry}")
+
+        if os.path.isdir(abs_entry):
+            for csv_path in get_all_csvs(abs_entry):
+                if csv_path not in seen_csv:
+                    seen_csv.add(csv_path)
+                    csv_paths.append(csv_path)
+            for zip_path in get_all_zips(abs_entry):
+                zip_paths.append(zip_path)
+        elif abs_entry.lower().endswith(".csv"):
+            if abs_entry not in seen_csv:
+                seen_csv.add(abs_entry)
+                csv_paths.append(abs_entry)
+        elif abs_entry.lower().endswith(".zip"):
+            zip_paths.append(abs_entry)
+        else:
+            raise ValueError(f"Unsupported local source type: {entry}")
+
+    for zip_path in zip_paths:
+        status.write(f"📂 Extracting local ZIP `{os.path.basename(zip_path)}`")
+        safe_extract(zip_path, extraction_dir)
+
+    for csv_path in get_all_csvs(extraction_dir):
+        if csv_path not in seen_csv:
+            seen_csv.add(csv_path)
+            csv_paths.append(csv_path)
+
+    return sorted(csv_paths)
 
 
 def inspect_csv_headers(csv_paths):
@@ -713,9 +770,9 @@ def process_multi_strategy(conn, csv_paths, artifacts_dir, temp_dir, status):
     return {"tables": tables_metadata, "columns": all_columns_meta, "relationships": relationships}
 
 
-def process_uploaded_files(uploaded_files, strategy):
-    if not uploaded_files:
-        raise ValueError("Please upload at least one CSV or ZIP file.")
+def process_input_sources(uploaded_files, local_source_text, strategy):
+    if not uploaded_files and not (local_source_text or "").strip():
+        raise ValueError("Please upload files or provide local CSV/ZIP paths.")
 
     root, bundle_dir, upload_dir, artifacts_dir = build_session_paths()
     robust_rmtree(root)
@@ -727,19 +784,27 @@ def process_uploaded_files(uploaded_files, strategy):
     conn = None
     try:
         total_uploaded_mb = 0.0
-        for uploaded in uploaded_files:
-            out_path = os.path.join(upload_dir, uploaded.name)
-            buf = uploaded.getbuffer()
-            total_uploaded_mb += len(buf) / (1024 * 1024)
-            with open(out_path, "wb") as handle:
-                handle.write(buf)
-            status.write(f"📥 Saved upload `{uploaded.name}`")
-            if uploaded.name.lower().endswith(".zip"):
-                status.write(f"📂 Extracting `{uploaded.name}`")
-                safe_extract(out_path, upload_dir)
-                os.remove(out_path)
+        csv_paths = []
+        source_mode = "cloud_upload"
 
-        csv_paths = get_all_csvs(upload_dir)
+        if uploaded_files:
+            for uploaded in uploaded_files:
+                out_path = os.path.join(upload_dir, uploaded.name)
+                buf = uploaded.getbuffer()
+                total_uploaded_mb += len(buf) / (1024 * 1024)
+                with open(out_path, "wb") as handle:
+                    handle.write(buf)
+                status.write(f"📥 Saved upload `{uploaded.name}`")
+                if uploaded.name.lower().endswith(".zip"):
+                    status.write(f"📂 Extracting `{uploaded.name}`")
+                    safe_extract(out_path, upload_dir)
+                    os.remove(out_path)
+            csv_paths = get_all_csvs(upload_dir)
+        else:
+            source_mode = "local_filesystem"
+            local_entries = parse_local_source_entries(local_source_text)
+            csv_paths = collect_local_source_files(local_entries, upload_dir, status)
+
         if not csv_paths:
             raise ValueError("No CSV files were found after upload and extraction.")
 
@@ -766,7 +831,7 @@ def process_uploaded_files(uploaded_files, strategy):
         metadata = {
             "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
             "chunk_size_mb": CHUNK_SIZE_MB,
-            "source_mode": "cloud_upload",
+            "source_mode": source_mode,
             "header_map": header_map,
             "tables": result["tables"],
             "columns": result["columns"],
@@ -1516,8 +1581,9 @@ SQL RULES:
 5. Use COUNT(DISTINCT ...) when the metric asks for distinct users or entities.
 6. If include_zero_activity_rows is true or population_scope is full_population, preserve the base population with LEFT JOINs to aggregated activity tables so zero-activity groups remain visible.
 7. Use INNER JOIN only when the question is explicitly about posters, active records, or filtered subsets only.
-8. Default to LIMIT 50 unless the query is already aggregated.
-9. Output only SQL, but leading SQL comments are allowed if helpful.
+8. If the question asks for sorting by a metric, the final SQL ORDER BY should use that metric rather than a label column whenever possible.
+9. Default to LIMIT 50 unless the query is already aggregated.
+10. Output only SQL, but leading SQL comments are allowed if helpful.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -1553,6 +1619,7 @@ Repair rules:
 1. Preserve the intended population scope from the plan.
 2. If include_zero_activity_rows is true, do not filter away zero-activity groups with an INNER JOIN to the activity table.
 3. Keep the SQL DuckDB-compatible and use only the available tables and columns.
+4. If the question asked for ranking by a metric, keep the final ORDER BY aligned to that metric.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -1727,6 +1794,7 @@ This local package lets you run the same Direction 2 app on your own machine.
 - Large sanitized or dummy datasets that are awkward to upload in the cloud
 - Faster iteration when testing preprocessing and question-answering behavior
 - Local experiments with the same planning-first analysis flow
+- Direct ingestion from local folders, CSV files, or ZIP files for very large datasets
 
 ## Recommended Python version
 
@@ -1779,6 +1847,7 @@ Create `.streamlit/secrets.toml` based on `.streamlit/secrets.toml.example`.
 - Use sanitized or dummy data only.
 - For multi-entity LMS-style exports, `Keep files as separate tables` is usually the better choice.
 - The local package uses a much higher upload setting than the cloud app.
+- In local mode, you can skip browser upload entirely by pasting local file or folder paths into the app.
 - Local mode avoids browser-upload limits, but very large jobs still depend on your machine's RAM and disk.
 """
 
@@ -1903,6 +1972,20 @@ def select_primary_metric(question, plan, df):
     return numeric_cols[0]
 
 
+def compress_duplicate_risk_note(value):
+    text = str(value or "").strip()
+    if not text:
+        return text
+    lower = text.lower()
+    if "no duplication risk" in lower or "low duplication risk" in lower:
+        return "Low duplication risk"
+    if "duplicate" in lower or "duplication" in lower:
+        if "distinct" in lower or "pre-aggreg" in lower or "mitigat" in lower:
+            return "Managed duplication risk"
+        return "Potential duplication risk"
+    return text
+
+
 def prepare_result_for_display(question, plan, df):
     if df.empty:
         return df, None, None
@@ -1930,6 +2013,10 @@ def prepare_result_for_display(question, plan, df):
             ascending=[False] + ([True] if category_col and category_col in display_df.columns else []),
             kind="stable",
         ).reset_index(drop=True)
+
+    for col in display_df.columns:
+        if "duplication" in col.lower() and display_df[col].dtype == "object":
+            display_df[col] = display_df[col].map(compress_duplicate_risk_note)
 
     return display_df, metric_col, category_col
 
@@ -2017,6 +2104,10 @@ maxUploadSize = 10240
         st.markdown(
             """
             Use this when your sanitized datasets are too large for browser upload or when you want more control over local CPU, RAM, and disk.
+
+            The local package can ingest data in two ways:
+            - browser upload, like the cloud app
+            - direct local file or folder paths, which is better for very large datasets
 
             The download includes:
             - `streamlit_app.py`
@@ -2115,8 +2206,15 @@ def render_processing_ui():
         total_mb = sum(len(item.getbuffer()) for item in uploaded_files) / (1024 * 1024)
         st.info(f"Selected {len(uploaded_files)} file(s), about {total_mb:.1f} MB total.")
 
+    local_source_text = st.text_area(
+        "Local CSV/ZIP paths or folders for local runs",
+        value="",
+        placeholder="/path/to/big-export-folder\n/path/to/Discussion-Posts.zip",
+        help="Use this in the downloaded local app to ingest large datasets directly from disk without browser upload.",
+    )
+
     if st.button("Process uploads", type="primary", use_container_width=True):
-        process_uploaded_files(uploaded_files, strategy)
+        process_input_sources(uploaded_files, local_source_text, strategy)
         st.rerun()
 
 
