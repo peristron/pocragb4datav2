@@ -231,3 +231,4 @@ status
 this is a prototype / proof of concept.
 
 it is intended to test large-dataset ai planning, privacy-first preparation workflows, and practical local/hosted streamlit patterns.
+```
